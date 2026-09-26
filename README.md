@@ -28,13 +28,6 @@ ux0:tai/netcheck_bypass.suprx
 You can also list it under individual title IDs instead if you only want
 specific games covered. Reboot afterwards.
 
-## Log
-
-The plugin appends a few lines per launch to `ux0:data/netcheck_bypass.log`:
-the title ID it saw, whether it treated the process as a game, which modules
-it hooked, and every sign-in request it cancelled. If a game still shows the
-prompt, that file says why.
-
 ## Build
 
 Requires [VitaSDK](https://vitasdk.org/).

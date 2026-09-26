@@ -30,7 +30,6 @@ target_link_libraries(${SHORT_NAME}
   taihen_stub
   SceAppMgr_stub
   SceLibKernel_stub
-  SceIofilemgr_stub
   SceKernelModulemgr_stub
 )
 

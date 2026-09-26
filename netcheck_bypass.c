@@ -12,22 +12,14 @@
  * prompt is never presented and the game carries on the way it does after a
  * manual Cancel. Ad-hoc and PS3-connect dialogs are passed through untouched.
  *
- * A short log of what the plugin saw and did is appended to
- * ux0:data/netcheck_bypass.log.
- *
  * The code is public domain.
  */
 
-#include <stdarg.h>
-
 #include <psp2/appmgr.h>
-#include <psp2/io/fcntl.h>
 #include <psp2/kernel/clib.h>
 #include <psp2/kernel/modulemgr.h>
 #include <psp2/netcheck_dialog.h>
 #include <taihen.h>
-
-#define LOG_PATH "ux0:data/netcheck_bypass.log"
 
 /* Library NID of SceCommonDialog, the library that exports the dialog API. */
 #define SCE_COMMON_DIALOG_LIB_NID 0xE537816C
@@ -51,8 +43,6 @@
 #define MODULE_LIST_ALL 0xFF
 #define MAX_MODULES 64
 
-static char g_titleid[16];
-
 /* Non-zero while a PSN dialog request is being answered on the game's behalf. */
 static int g_faking;
 
@@ -74,34 +64,6 @@ typedef struct {
 static installed_hook_t g_installed[MAX_MODULES * NUM_TARGETS];
 static int g_installed_count;
 
-/* ---------------------------------------------------------------- logging */
-
-static void log_printf(const char *fmt, ...) {
-  char line[192];
-  va_list ap;
-  int len;
-  SceUID fd;
-
-  len = sceClibSnprintf(line, sizeof(line), "[%s] ", g_titleid);
-  if (len < 0 || len >= (int)sizeof(line)) {
-    return;
-  }
-  va_start(ap, fmt);
-  len += sceClibVsnprintf(line + len, sizeof(line) - len, fmt, ap);
-  va_end(ap);
-  if (len >= (int)sizeof(line) - 1) {
-    len = (int)sizeof(line) - 2;
-  }
-  line[len++] = '\n';
-
-  fd = sceIoOpen(LOG_PATH, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
-  if (fd < 0) {
-    return;
-  }
-  sceIoWrite(fd, line, len);
-  sceIoClose(fd);
-}
-
 /* ------------------------------------------------------------------ hooks */
 
 static int wants_psn_login(const SceNetCheckDialogParam *param) {
@@ -116,28 +78,24 @@ static int wants_psn_login(const SceNetCheckDialogParam *param) {
  * Decide what to do with a dialog request. Returns 1 if the request is a PSN
  * sign-in that is now being faked, 0 if it must go to the real dialog.
  */
-static int intercept_init(const SceNetCheckDialogParam *param, const char *entry) {
+static int intercept_init(const SceNetCheckDialogParam *param) {
   if (wants_psn_login(param)) {
-    log_printf("%s mode=%d: PSN sign-in requested, answering Cancel without showing it",
-               entry, param->mode);
     g_faking = 1;
     return 1;
   }
-  log_printf("%s mode=%d: not a PSN sign-in, passed through",
-             entry, param != NULL ? param->mode : -1);
   g_faking = 0;
   return 0;
 }
 
 static int sceNetCheckDialogInit_patched(SceNetCheckDialogParam *param) {
-  if (intercept_init(param, "sceNetCheckDialogInit")) {
+  if (intercept_init(param)) {
     return 0;
   }
   return TAI_CONTINUE(int, g_init_ref, param);
 }
 
 static int sceNetCheckDialogInit2_patched(SceNetCheckDialogParam *param, void *opt) {
-  if (intercept_init(param, "sceNetCheckDialogInit2")) {
+  if (intercept_init(param)) {
     return 0;
   }
   return TAI_CONTINUE(int, g_init2_ref, param, opt);
@@ -181,19 +139,18 @@ static int sceNetCheckDialogTerm_patched(void) {
 /* ------------------------------------------------------------ installing */
 
 typedef struct {
-  const char *name;
   uint32_t nid;
   const void *func;
   tai_hook_ref_t *ref;
 } hook_target_t;
 
 static const hook_target_t g_targets[NUM_TARGETS] = {
-  { "Init",      NID_NETCHECK_INIT,      sceNetCheckDialogInit_patched,      &g_init_ref },
-  { "Init2",     NID_NETCHECK_INIT2,     sceNetCheckDialogInit2_patched,     &g_init2_ref },
-  { "Abort",     NID_NETCHECK_ABORT,     sceNetCheckDialogAbort_patched,     &g_abort_ref },
-  { "GetResult", NID_NETCHECK_GETRESULT, sceNetCheckDialogGetResult_patched, &g_getresult_ref },
-  { "GetStatus", NID_NETCHECK_GETSTATUS, sceNetCheckDialogGetStatus_patched, &g_getstatus_ref },
-  { "Term",      NID_NETCHECK_TERM,      sceNetCheckDialogTerm_patched,      &g_term_ref },
+  { NID_NETCHECK_INIT,      sceNetCheckDialogInit_patched,      &g_init_ref },
+  { NID_NETCHECK_INIT2,     sceNetCheckDialogInit2_patched,     &g_init2_ref },
+  { NID_NETCHECK_ABORT,     sceNetCheckDialogAbort_patched,     &g_abort_ref },
+  { NID_NETCHECK_GETRESULT, sceNetCheckDialogGetResult_patched, &g_getresult_ref },
+  { NID_NETCHECK_GETSTATUS, sceNetCheckDialogGetStatus_patched, &g_getstatus_ref },
+  { NID_NETCHECK_TERM,      sceNetCheckDialogTerm_patched,      &g_term_ref },
 };
 
 /*
@@ -224,8 +181,6 @@ static void hook_module(const char *modname) {
     if (*t->ref == 0) {
       *t->ref = ref;
     }
-    log_printf("hooked sceNetCheckDialog%s in module %s", t->name,
-               modname != NULL ? modname : "(main)");
   }
 }
 
@@ -233,12 +188,9 @@ static void hook_all_modules(void) {
   SceUID uids[MAX_MODULES];
   SceSize num = MAX_MODULES;
   SceKernelModuleInfo info;
-  int ret;
   SceSize i;
 
-  ret = sceKernelGetModuleList(MODULE_LIST_ALL, uids, &num);
-  if (ret < 0) {
-    log_printf("sceKernelGetModuleList failed: 0x%08X, hooking main module only", ret);
+  if (sceKernelGetModuleList(MODULE_LIST_ALL, uids, &num) < 0) {
     hook_module(NULL);
     return;
   }
@@ -263,15 +215,15 @@ static void hook_all_modules(void) {
  * "PCS" prefix is what identifies a game.
  */
 static int running_in_game(void) {
+  char titleid[16];
   int ret;
 
-  g_titleid[0] = '\0';
-  ret = sceAppMgrAppParamGetString(0, APP_PARAM_TITLE_ID, g_titleid, sizeof(g_titleid));
+  titleid[0] = '\0';
+  ret = sceAppMgrAppParamGetString(0, APP_PARAM_TITLE_ID, titleid, sizeof(titleid));
   if (ret < 0) {
-    sceClibSnprintf(g_titleid, sizeof(g_titleid), "err %08X", ret);
     return 0;
   }
-  return g_titleid[0] == 'P' && g_titleid[1] == 'C' && g_titleid[2] == 'S';
+  return titleid[0] == 'P' && titleid[1] == 'C' && titleid[2] == 'S';
 }
 
 void _start() __attribute__ ((weak, alias ("module_start")));
@@ -281,14 +233,10 @@ int module_start(SceSize argc, const void *args) {
 
   if (!running_in_game()) {
     /* Not a game: stay inert. Nothing is hooked, so nothing can be affected. */
-    log_printf("not a game, staying inert");
     return SCE_KERNEL_START_SUCCESS;
   }
 
-  log_printf("game detected, installing hooks");
   hook_all_modules();
-  log_printf("%d hooks installed (Init hooked: %s)",
-             g_installed_count, g_init_ref != 0 ? "yes" : "NO");
   return SCE_KERNEL_START_SUCCESS;
 }
 
