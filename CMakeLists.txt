@@ -28,6 +28,8 @@ add_executable(${SHORT_NAME}
 
 target_link_libraries(${SHORT_NAME}
   taihen_stub
+  SceAppMgr_stub
+  SceLibKernel_stub
 )
 
 set_target_properties(${SHORT_NAME}

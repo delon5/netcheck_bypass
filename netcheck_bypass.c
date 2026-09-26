@@ -1,147 +1,127 @@
+/*
+ * netcheck_bypass -- keep PS Vita games away from PSN sign-in
+ *
+ * taiHEN user plugin. It only acts inside retail games (title IDs that start
+ * with "PCS"); in every other process module_start installs no hooks, so
+ * SceShell, system apps and homebrew are never touched.
+ *
+ * Inside a game the sceNetCheckDialogInit import is hooked. When the game asks
+ * for the PSN sign-in dialog (mode PSN or PSN_ONLINE) the game is terminated on
+ * the spot: it is closed and the login prompt is never presented. Ad-hoc and
+ * PS3-connect dialogs are passed through untouched.
+ *
+ * The code is public domain.
+ */
+
+#include <psp2/appmgr.h>
 #include <psp2/kernel/modulemgr.h>
+#include <psp2/kernel/processmgr.h>
+#include <psp2/netcheck_dialog.h>
 #include <taihen.h>
 
-#define SCE_NETCHECK_DIALOG_MODE_PSN 2
-#define SCE_NETCHECK_DIALOG_MODE_PSN_ONLINE 3
+/* Library NID of SceCommonDialog, the library that exports the dialog API. */
+#define SCE_COMMON_DIALOG_LIB_NID 0xE537816C
 
-#define SCE_COMMON_DIALOG_ERROR_NOT_IN_USE 0x80020411
-#define SCE_COMMON_DIALOG_STATUS_NONE 0
-#define SCE_COMMON_DIALOG_STATUS_FINISHED 2
+/* sceNetCheckDialogInit */
+#define SCE_NETCHECK_DIALOG_INIT_NID 0xA38A4A0D
 
-typedef struct SceCommonDialogParam {
-  void *infobarParam;
-  void *bgColor;
-  void *dimmerColor;
-  char reserved[60];
-  int magic;
-} SceCommonDialogParam;
+/*
+ * Second sceNetCheckDialogInit entry point hooked by the original plugin. It is
+ * not listed in the public NID database; in titles that do not import it the
+ * hook simply fails to install, which is harmless.
+ */
+#define SCE_NETCHECK_DIALOG_INIT2_NID 0x243D6A36
 
-typedef struct SceNetCheckDialogAgeRestriction {
-  char countryCode[2];
-  char age;
-  char padding;
-} SceNetCheckDialogAgeRestriction;
+/* sceAppMgrAppParamGetString() parameter id of the title ID (param.sfo TITLE_ID). */
+#define APP_PARAM_TITLE_ID 12
 
-typedef struct SceNetCheckDialogParam {
-  int sdkVersion;
-  SceCommonDialogParam commonParam;
-  int mode;
-  int npCommunicationId;
-  int *ps3ConnectParam;
-  void *groupName;
-  int timeoutUs;
-  char defaultAgeRestriction;
-  char padding[3];
-  int ageRestrictionCount;
-  const SceNetCheckDialogAgeRestriction *ageRestriction;
-  char reserved[104];
-} SceNetCheckDialogParam;
+/* Exit status handed to the kernel when a game is stopped. */
+#define STOPPED_GAME_EXIT_STATUS 0
 
-static SceUID g_hooks[6];
+/* Hook handles; -1 means "not installed". */
+static SceUID g_init_hook = -1;
+static SceUID g_init2_hook = -1;
 
-static tai_hook_ref_t g_sceNetCheckDialogInit_hook;
+static tai_hook_ref_t g_init_ref;
+static tai_hook_ref_t g_init2_ref;
+
+/*
+ * Retail games and PSN releases carry title IDs PCSA..PCSH. System apps are
+ * NPXSxxxxx, SceShell is "main" and homebrew picks whatever it likes, so a
+ * "PCS" prefix is what identifies a game.
+ */
+static int running_in_game(void) {
+  char titleid[16];
+  int ret;
+
+  titleid[0] = '\0';
+  ret = sceAppMgrAppParamGetString(0, APP_PARAM_TITLE_ID, titleid, sizeof(titleid));
+  if (ret < 0) {
+    return 0;
+  }
+  return titleid[0] == 'P' && titleid[1] == 'C' && titleid[2] == 'S';
+}
+
+static int wants_psn_login(const SceNetCheckDialogParam *param) {
+  if (param == NULL) {
+    return 0;
+  }
+  return param->mode == SCE_NETCHECK_DIALOG_MODE_PSN ||
+         param->mode == SCE_NETCHECK_DIALOG_MODE_PSN_ONLINE;
+}
+
+/*
+ * Close the game. sceKernelExitProcess() does not return; the value below is
+ * only reached if the kernel refused to end the process, in which case the
+ * dialog request is rejected so the sign-in prompt still never appears.
+ */
+static int stop_game(void) {
+  sceKernelExitProcess(STOPPED_GAME_EXIT_STATUS);
+  return (int)SCE_COMMON_DIALOG_ERROR_NOT_AVAILABLE;
+}
+
 static int sceNetCheckDialogInit_patched(SceNetCheckDialogParam *param) {
-  int ret;
-  if (param->mode == SCE_NETCHECK_DIALOG_MODE_PSN || param->mode == SCE_NETCHECK_DIALOG_MODE_PSN_ONLINE) {
-    ret = 0;
-  } else {
-    ret = TAI_CONTINUE(int, g_sceNetCheckDialogInit_hook, param);
+  if (wants_psn_login(param)) {
+    return stop_game();
   }
-  return ret;
+  return TAI_CONTINUE(int, g_init_ref, param);
 }
 
-static tai_hook_ref_t g_sceNetCheckDialogInit2_hook;
 static int sceNetCheckDialogInit2_patched(SceNetCheckDialogParam *param, void *opt) {
-  int ret;
-  if (param->mode == SCE_NETCHECK_DIALOG_MODE_PSN || param->mode == SCE_NETCHECK_DIALOG_MODE_PSN_ONLINE) {
-    ret = 0;
-  } else {
-    ret = TAI_CONTINUE(int, g_sceNetCheckDialogInit2_hook, param, opt);
+  if (wants_psn_login(param)) {
+    return stop_game();
   }
-  return ret;
-}
-
-static tai_hook_ref_t g_sceNetCheckDialogAbort_hook;
-static int sceNetCheckDialogAbort_patched(void) {
-  int ret;
-  ret = TAI_CONTINUE(int, g_sceNetCheckDialogAbort_hook);
-  if (ret == SCE_COMMON_DIALOG_ERROR_NOT_IN_USE) {
-    ret = 0;
-  }
-  return ret;
-}
-
-static tai_hook_ref_t g_sceNetCheckDialogGetResult_hook;
-static int sceNetCheckDialogGetResult_patched(void *result) {
-  int ret;
-  ret = TAI_CONTINUE(int, g_sceNetCheckDialogGetResult_hook, result);
-  if (ret == SCE_COMMON_DIALOG_ERROR_NOT_IN_USE) {
-    ret = 0;
-  }
-  return ret;
-}
-
-static tai_hook_ref_t g_sceNetCheckDialogGetStatus_hook;
-static int sceNetCheckDialogGetStatus_patched(void) {
-  int ret;
-  ret = TAI_CONTINUE(int, g_sceNetCheckDialogGetStatus_hook);
-  if (ret == SCE_COMMON_DIALOG_ERROR_NOT_IN_USE || ret == SCE_COMMON_DIALOG_STATUS_NONE) {
-    ret = SCE_COMMON_DIALOG_STATUS_FINISHED;
-  }
-  return ret;
-}
-
-static tai_hook_ref_t g_sceNetCheckDialogTerm_hook;
-static int sceNetCheckDialogTerm_patched(void) {
-  int ret;
-  ret = TAI_CONTINUE(int, g_sceNetCheckDialogTerm_hook);
-  if (ret == SCE_COMMON_DIALOG_ERROR_NOT_IN_USE) {
-    ret = 0;
-  }
-  return ret;
+  return TAI_CONTINUE(int, g_init2_ref, param, opt);
 }
 
 void _start() __attribute__ ((weak, alias ("module_start")));
 int module_start(SceSize argc, const void *args) {
-  g_hooks[0] = taiHookFunctionImport(&g_sceNetCheckDialogInit_hook, 
-                                      TAI_MAIN_MODULE, 
-                                      0xE537816C, // SceCommonDialog
-                                      0xA38A4A0D, 
+  (void)argc;
+  (void)args;
+
+  if (!running_in_game()) {
+    /* Not a game: stay inert. Nothing is hooked, so nothing can be affected. */
+    return SCE_KERNEL_START_SUCCESS;
+  }
+
+  g_init_hook = taiHookFunctionImport(&g_init_ref,
+                                      TAI_MAIN_MODULE,
+                                      SCE_COMMON_DIALOG_LIB_NID,
+                                      SCE_NETCHECK_DIALOG_INIT_NID,
                                       sceNetCheckDialogInit_patched);
-  g_hooks[1] = taiHookFunctionImport(&g_sceNetCheckDialogInit2_hook, 
-                                      TAI_MAIN_MODULE, 
-                                      0xE537816C, // SceCommonDialog
-                                      0x243D6A36, 
-                                      sceNetCheckDialogInit2_patched);
-  g_hooks[2] = taiHookFunctionImport(&g_sceNetCheckDialogAbort_hook, 
-                                      TAI_MAIN_MODULE, 
-                                      0xE537816C, // SceCommonDialog
-                                      0x2D8EDF09, 
-                                      sceNetCheckDialogAbort_patched);
-  g_hooks[3] = taiHookFunctionImport(&g_sceNetCheckDialogGetResult_hook, 
-                                      TAI_MAIN_MODULE, 
-                                      0xE537816C, // SceCommonDialog
-                                      0xB05FCE9E, 
-                                      sceNetCheckDialogGetResult_patched);
-  g_hooks[4] = taiHookFunctionImport(&g_sceNetCheckDialogGetStatus_hook, 
-                                      TAI_MAIN_MODULE, 
-                                      0xE537816C, // SceCommonDialog
-                                      0x8027292A, 
-                                      sceNetCheckDialogGetStatus_patched);
-  g_hooks[5] = taiHookFunctionImport(&g_sceNetCheckDialogTerm_hook, 
-                                      TAI_MAIN_MODULE, 
-                                      0xE537816C, // SceCommonDialog
-                                      0x8BE51C15, 
-                                      sceNetCheckDialogTerm_patched);
+  g_init2_hook = taiHookFunctionImport(&g_init2_ref,
+                                       TAI_MAIN_MODULE,
+                                       SCE_COMMON_DIALOG_LIB_NID,
+                                       SCE_NETCHECK_DIALOG_INIT2_NID,
+                                       sceNetCheckDialogInit2_patched);
   return SCE_KERNEL_START_SUCCESS;
 }
 
 int module_stop(SceSize argc, const void *args) {
-  if (g_hooks[0] >= 0) taiHookRelease(g_hooks[0], g_sceNetCheckDialogInit_hook);
-  if (g_hooks[1] >= 0) taiHookRelease(g_hooks[1], g_sceNetCheckDialogInit2_hook);
-  if (g_hooks[2] >= 0) taiHookRelease(g_hooks[2], g_sceNetCheckDialogAbort_hook);
-  if (g_hooks[3] >= 0) taiHookRelease(g_hooks[3], g_sceNetCheckDialogGetResult_hook);
-  if (g_hooks[4] >= 0) taiHookRelease(g_hooks[4], g_sceNetCheckDialogGetStatus_hook);
-  if (g_hooks[5] >= 0) taiHookRelease(g_hooks[5], g_sceNetCheckDialogTerm_hook);
+  (void)argc;
+  (void)args;
+
+  if (g_init2_hook >= 0) taiHookRelease(g_init2_hook, g_init2_ref);
+  if (g_init_hook >= 0) taiHookRelease(g_init_hook, g_init_ref);
   return SCE_KERNEL_STOP_SUCCESS;
 }
